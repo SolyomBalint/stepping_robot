@@ -24,13 +24,15 @@ private:
     String rxBuffer;
 
     void processLine(
-        const String& line,
+        String line,
         Controller& controller
     );
 
     void sendTelemetry(
         Controller& controller
     );
+
+    Milliseconds lastTelemetry = 0;
 };
 
 #endif
