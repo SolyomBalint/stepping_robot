@@ -1,0 +1,3 @@
+mediapipe
+numpy<2
+pyserial
