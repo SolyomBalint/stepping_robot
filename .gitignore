@@ -12,4 +12,5 @@ devenv.local.yaml
 
 hand_detection/__pycache__/
 hand_detection/legacy_0.10.21/
+hand_detection/models/
 CLAUDE.md

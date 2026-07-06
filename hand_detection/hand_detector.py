@@ -1,21 +1,18 @@
 """Headless hand tracker for the XY stepping robot.
 
-Captures a top-down video stream, detects a single human hand, reduces it to one
-point (the median of its landmarks), maps that point from image space into the
-physical working area, and streams the position to the Arduino over serial as
-``MOVE <x_mm> <y_mm> <speed>`` lines.
+Captures a video stream, detects a single human hand, reduces it to one
+point (the barycentric center of its landmarks), maps that point from image space
+into the physical working area, and streams the position to the Arduino over
+serial as ``MOVE <x_mm> <y_mm> <speed>`` lines.
 
 Image -> plane mapping (no depth; camera is fixed above the plane):
 
-    The frame's real-world footprint at the plane is derived from the camera
-    field of view and its distance to the plane:
-
-        footprint = 2 * distance * tan(fov / 2)
-
-    The rectangular working area (``plane_*_cm``) is assumed centered inside that
-    footprint. Only points that land inside the working area are sent; anything
-    outside the box is dropped. Output is millimetres with the origin at a corner,
-    to match the firmware (see MachineConfig.h / stepsPerMM).
+    The full camera frame maps directly onto the working plane: the stream
+    resolution (e.g. 1920x1080) is detected at startup, and wherever the hand's
+    center lands within that resolution is scaled proportionally onto the
+    configured plane size (``plane_*_cm``). A center that lands off-frame is
+    clamped to the nearest plane edge. Output is millimetres with the origin at a
+    corner, to match the firmware (see MachineConfig.h / stepsPerMM).
 """
 
 import argparse
@@ -48,15 +45,10 @@ MODEL_PATH = os.path.join(
 
 @dataclass
 class Config:
-    # --- Camera geometry -------------------------------------------------
     camera_index: int = 0
-    camera_distance_cm: float = 120.0  # camera lens -> plane surface
-    camera_hfov_deg: float = 66.0  # horizontal field of view (camera-specific)
-    camera_vfov_deg: float = 52.0  # vertical field of view
 
-    # --- Working area ----------------------------------------------------
-    # Physical size of the reachable XY box, in cm. Assumed centered in the
-    # camera footprint. Points outside this box are not sent.
+    # Physical size of the reachable XY plane, in cm. The full camera frame is
+    # mapped onto this plane, so the whole frame corresponds to the whole plane.
     plane_width_cm: float = 40.0
     plane_height_cm: float = 40.0
 
@@ -65,59 +57,38 @@ class Config:
     invert_x: bool = False
     invert_y: bool = False
 
-    # --- Serial link -----------------------------------------------------
     serial_port: str = "/dev/ttyACM0"
     serial_baud: int = 115200
     move_speed: float = 200.0  # the "speed" field of the MOVE command (mm/s)
 
-    # --- Output smoothing ------------------------------------------------
     min_send_interval_s: float = 0.05  # cap the serial rate (<= 20 Hz here)
     deadband_mm: float = 2.0  # skip sends smaller than this
 
-    # --- Detection -------------------------------------------------------
     min_detection_confidence: float = 0.5
     min_tracking_confidence: float = 0.5
 
 
-def footprint_cm(cfg: Config) -> tuple[float, float]:
-    """Real-world size (cm) the full frame covers at the plane distance."""
-    width = (
-        2.0
-        * cfg.camera_distance_cm
-        * math.tan(math.radians(cfg.camera_hfov_deg) / 2.0)
-    )
-    height = (
-        2.0
-        * cfg.camera_distance_cm
-        * math.tan(math.radians(cfg.camera_vfov_deg) / 2.0)
-    )
-    return width, height
-
-
 def image_to_plane_mm(
-    norm_x: float,
-    norm_y: float,
+    pixel_x: float,
+    pixel_y: float,
+    resolution: tuple[int, int],
     cfg: Config,
-    footprint: tuple[float, float],
-) -> tuple[float, float] | None:
-    """Map a normalized image point (0..1) to plane coordinates in mm.
+) -> tuple[float, float]:
+    """Map a pixel position in the camera frame to plane coordinates in mm.
 
-    Returns ``None`` if the point falls outside the configured working area.
+    The full frame maps onto the full plane: the pixel's fractional position
+    within ``resolution`` is scaled onto ``plane_*_cm``. A position that lands
+    off-frame is clamped to the nearest plane edge.
     """
-    fw, fh = footprint
+    res_w, res_h = resolution
 
-    # Position within the camera footprint, cm, origin at the frame's top-left.
-    fx = norm_x * fw
-    fy = norm_y * fh
+    # Fractional position within the frame, scaled onto the plane (cm).
+    px = (pixel_x / res_w) * cfg.plane_width_cm
+    py = (pixel_y / res_h) * cfg.plane_height_cm
 
-    # The working box is centered in the footprint; shift into box-local cm.
-    px = fx - (fw - cfg.plane_width_cm) / 2.0
-    py = fy - (fh - cfg.plane_height_cm) / 2.0
-
-    if not (
-        0.0 <= px <= cfg.plane_width_cm and 0.0 <= py <= cfg.plane_height_cm
-    ):
-        return None
+    # A partly off-screen hand can land just outside the frame; clamp it.
+    px = min(max(px, 0.0), cfg.plane_width_cm)
+    py = min(max(py, 0.0), cfg.plane_height_cm)
 
     if cfg.invert_x:
         px = cfg.plane_width_cm - px
@@ -127,16 +98,16 @@ def image_to_plane_mm(
     return px * 10.0, py * 10.0  # cm -> mm, corner origin
 
 
-def median_point(hand_landmarks) -> tuple[float, float]:
-    """Median (x, y) of a hand's landmarks in normalized image coordinates.
+def centroid_point(hand_landmarks) -> tuple[float, float]:
+    """Barycentric center (x, y) of a hand's landmarks in normalized coords.
 
-    The median is robust to individual finger outliers, giving a stable
-    palm-centered point. With a top-down camera and no depth this is the hand's
-    projection onto the plane.
+    Averaging all landmarks gives the hand's centroid, a stable palm-centered
+    point. With a top-down camera and no depth this is the hand's projection
+    onto the plane.
     """
     xs = [lm.x for lm in hand_landmarks]
     ys = [lm.y for lm in hand_landmarks]
-    return float(np.median(xs)), float(np.median(ys))
+    return float(np.mean(xs)), float(np.mean(ys))
 
 
 class MotionSender:
@@ -187,6 +158,28 @@ def draw_landmarks(frame, result: HandLandmarkerResult) -> None:
         )
 
 
+def draw_center(
+    frame,
+    pixel: tuple[float, float],
+    mm: tuple[float, float],
+) -> None:
+    """Mark the computed barycentric center on the debug window (--show)."""
+    cx, cy = int(round(pixel[0])), int(round(pixel[1]))
+    color = (0, 0, 255)  # BGR: red
+    cv2.drawMarker(frame, (cx, cy), color, cv2.MARKER_CROSS, 20, 2)
+    cv2.circle(frame, (cx, cy), 8, color, 2)
+    cv2.putText(
+        frame,
+        f"({mm[0]:.0f}, {mm[1]:.0f}) mm",
+        (cx + 12, cy - 12),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        color,
+        1,
+        cv2.LINE_AA,
+    )
+
+
 def run(cfg: Config, sender: MotionSender, show: bool = False) -> None:
     options = HandLandmarkerOptions(
         base_options=BaseOptions(model_asset_path=MODEL_PATH),
@@ -196,18 +189,20 @@ def run(cfg: Config, sender: MotionSender, show: bool = False) -> None:
         min_tracking_confidence=cfg.min_tracking_confidence,
     )
 
-    footprint = footprint_cm(cfg)
-    print(
-        f"[calib] footprint at {cfg.camera_distance_cm:.0f} cm: "
-        f"{footprint[0]:.1f} x {footprint[1]:.1f} cm; "
-        f"working area {cfg.plane_width_cm:.0f} x {cfg.plane_height_cm:.0f} cm (centered)"
-    )
-    if cfg.plane_width_cm > footprint[0] or cfg.plane_height_cm > footprint[1]:
-        print(
-            "[calib] WARNING: working area is larger than the camera footprint"
-        )
-
     cap = cv2.VideoCapture(index=cfg.camera_index)
+
+    res_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    res_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if res_w <= 0 or res_h <= 0:
+        raise RuntimeError(
+            f"could not read camera resolution (camera index {cfg.camera_index} "
+            "may be unavailable)"
+        )
+    resolution = (res_w, res_h)
+    print(
+        f"[calib] camera resolution {res_w}x{res_h} mapped onto working plane "
+        f"{cfg.plane_width_cm:.0f} x {cfg.plane_height_cm:.0f} cm"
+    )
 
     last_send_time = 0.0
     last_x_mm: float | None = None
@@ -232,28 +227,32 @@ def run(cfg: Config, sender: MotionSender, show: bool = False) -> None:
                 timestamp_ms = int(time.monotonic() * 1000)
                 result = landmarker.detect_for_video(mp_image, timestamp_ms)
 
+                center_px: tuple[float, float] | None = None
+                center_mm: tuple[float, float] | None = None
                 if result.hand_landmarks:
-                    norm_x, norm_y = median_point(result.hand_landmarks[0])
-                    point_mm = image_to_plane_mm(norm_x, norm_y, cfg, footprint)
+                    norm_x, norm_y = centroid_point(result.hand_landmarks[0])
+                    center_px = (norm_x * res_w, norm_y * res_h)
+                    x_mm, y_mm = image_to_plane_mm(
+                        center_px[0], center_px[1], resolution, cfg
+                    )
+                    center_mm = (x_mm, y_mm)
 
-                    if point_mm is not None:
-                        x_mm, y_mm = point_mm
-                        now = time.monotonic()
-                        rate_ok = (
-                            now - last_send_time >= cfg.min_send_interval_s
-                        )
-                        moved = (
-                            last_x_mm is None
-                            or math.hypot(x_mm - last_x_mm, y_mm - last_y_mm)
-                            >= cfg.deadband_mm
-                        )
-                        if rate_ok and moved:
-                            sender.send(x_mm, y_mm)
-                            last_send_time = now
-                            last_x_mm, last_y_mm = x_mm, y_mm
+                    now = time.monotonic()
+                    rate_ok = now - last_send_time >= cfg.min_send_interval_s
+                    moved = (
+                        last_x_mm is None
+                        or math.hypot(x_mm - last_x_mm, y_mm - last_y_mm)
+                        >= cfg.deadband_mm
+                    )
+                    if rate_ok and moved:
+                        sender.send(x_mm, y_mm)
+                        last_send_time = now
+                        last_x_mm, last_y_mm = x_mm, y_mm
 
                 if show:
                     draw_landmarks(frame, result)
+                    if center_px is not None:
+                        draw_center(frame, center_px, center_mm)
                     cv2.imshow("Hand Tracking", cv2.flip(frame, 1))
                     if cv2.waitKey(1) & 0xFF == ord("q"):
                         break
@@ -282,6 +281,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--camera-index", type=int, help="camera index (overrides config)"
     )
+    parser.add_argument(
+        "--plane-width",
+        type=float,
+        metavar="CM",
+        help="working plane width in cm (overrides config)",
+    )
+    parser.add_argument(
+        "--plane-height",
+        type=float,
+        metavar="CM",
+        help="working plane height in cm (overrides config)",
+    )
     return parser.parse_args()
 
 
@@ -292,6 +303,10 @@ def main() -> None:
         cfg.serial_port = args.port
     if args.camera_index is not None:
         cfg.camera_index = args.camera_index
+    if args.plane_width is not None:
+        cfg.plane_width_cm = args.plane_width
+    if args.plane_height is not None:
+        cfg.plane_height_cm = args.plane_height
 
     sender = MotionSender(cfg, mock=args.mock)
     run(cfg, sender, show=args.show)

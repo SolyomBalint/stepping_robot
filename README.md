@@ -1,19 +1,3 @@
 # stepping_robot
 
-This project aims to explore human interaction with moving robot parts. It's a
-direct collaboration between MOME Robotics Research Lab and BME Robotics Club
-Pledge team.
-
-# Main Tasks
-
- - [  ] Figure out how the stepping motors work and create a clean interface for communication.
- - [  ] Put together an elevating robot for the head that will later push up/down the pin heads
- - [  ] Print/create a head as it is missing right now
- - [  ] Put the previous three together
-
-## Future tasks
-
- - [  ] Think about how to make the pinboard move fluidly
- - [  ] More complex control logic/advanced interfacing with the controls to detach more easily from the hardware
-
-
+This is a collaboration between the MOME Robotics Research Lab and BME Robotics Club pledges. Their [project](https://www.momerobotics.com/embracing-vulnerability-in-robotic-companions/) aimed to discover interactions between humans and robots that took both parties into account in a thoughtful and empathetic manner. This materialized as a small robot that detected approaching objects and reacted by elevating a pinboard. To further improve the design, custom hardware with a two-axis Cartesian stepping robot based on an Arduino Mega + CNC Shield V3 were added, controlled by a Raspberry Pi. This project contains the relevant software implementation for these additions.
